@@ -29,7 +29,7 @@ I also tested 2x and 3x leveraged ETFs. From 2018 to 2026, with the trend filter
 
 | | Return per year | Worst drawdown |
 |---|---|---|
-| TQQQ, this strategy | 28.7% | -47% |
+| TQQQ, overnight with the trend rule | 28.7% | -47% |
 | TQQQ, buy and hold | 35.3% | -82% |
 
 Buy-and-hold TQQQ made more, but it also fell 82% at one point. The overnight version captured most of the gain with a much smaller worst case. I'm skeptical of these numbers though: 2018–2026 was a great period for the Nasdaq, and when I simulated a 3x Nasdaq fund through the 2000–2002 crash, $500 dropped to about $264 even with the trend filter. So I'm paper trading it first.
@@ -48,7 +48,7 @@ I checked whether that shows up in plain daily SPY data (`research/overnight_dri
 
 It held in both 1993–2009 and 2010–2026. That created a conflict with my trend filter, which sits out exactly when prices are falling. So I tested variants. Only trading after down days was worse, because up-day nights still earn more than the trading cost. The version that worked was **"hold if the trend is up OR the price fell today"**:
 
-| | Current rule (trend only) | Trend OR down day |
+| | Trend only (original rule) | Trend OR down day (what the bot runs now) |
 |---|---|---|
 | SPY 1994–2026 | 8.3%/yr, worst -13% | 10.1%/yr, worst -20% |
 | TQQQ 2011–2026 | 29.1%/yr, worst -47% | 36.5%/yr, worst -52% |
@@ -76,7 +76,7 @@ These are the parts I spent the most time on, because a bug here costs real mone
 - **No settlement violations.** Alpaca accounts under $2,000 are "limited margin" and can trade on unsettled funds, so the daily round trip doesn't trigger good-faith violations.
 - **Drawdown stop.** New buys stop if equity falls a set percentage below its peak. Sells always still happen.
 - **Kill switch.** A `STOP` file blocks new buys. `run_bot.py flatten` sells everything immediately.
-- **Account checks.** If Alpaca flags the account as blocked, or ever counts a day trade, the bot stops buying and alerts me.
+- **Account checks.** If Alpaca flags the account as blocked or suspended, the bot stops buying and alerts me. It also alerts me if Alpaca ever counts a day trade, which should never happen.
 - **Paper by default.** Live trading needs both `ALPACA_PAPER=false` and a `--live` flag, so it can't happen by accident.
 
 ## Running it on AWS
@@ -96,7 +96,7 @@ flowchart LR
 
 - **Compute:** EC2 t4g.micro (AWS Graviton, Arm) running Ubuntu 24.04, with 1 GB of swap so installing pandas doesn't run out of memory.
 - **Scheduling:** a systemd service + timer (`deploy/systemd/`). It survives reboots, and the logs go to `journalctl` as well as `logs/bot.log`.
-- **Alerts:** every buy, sell, skip and error is published to an SNS topic that emails me. Fills include the P&L, like `SOLD 6 TQQQ @ $75.02: +$5.52 (+1.24%)`.
+- **Alerts:** every buy, sell, skip and error is published to an SNS topic that emails me. Fills include the P&L, like `[default] SOLD 6 TQQQ @ $75.02 ($450.12): +$5.52 (+1.24%)`.
 - **No stored AWS keys:** the server gets temporary credentials from an IAM role. The role's only permission is `sns:Publish` on that one topic, plus the AWS-managed policy Session Manager needs.
 - **No open inbound ports:** the security group has zero inbound rules. I connect with Session Manager, and `ssh`/`rsync` are tunneled through it via a `ProxyCommand`, so access is controlled by IAM instead of an IP allowlist.
 - **Secrets:** the Alpaca keys live only in `.env` on the server (`chmod 600`) and are never committed.
@@ -107,9 +107,9 @@ flowchart LR
 Every fill is appended to `journal/trades.csv`: time, side, shares, price, and P&L when a sell closes a buy. The bot tracks which order IDs it has already recorded, so a fill is never written twice.
 
 ```bash
-python run_bot.py trades     # journal plus totals
-python run_bot.py report     # P&L rebuilt from Alpaca's order history
-python run_bot.py status     # account, position, open orders
+.venv/bin/python run_bot.py trades     # journal plus totals
+.venv/bin/python run_bot.py report     # P&L rebuilt from Alpaca's order history
+.venv/bin/python run_bot.py status     # account, position, open orders
 ```
 
 ## Project layout
@@ -131,7 +131,7 @@ scripts/deploy.sh             rsync to the server and run the tests there
 tests/                        42 tests
 ```
 
-Keeping `decide.py` free of network calls made the most important logic easy to test. The tests in `tests/test_bot_flow.py` run the real `tick` function through full simulated trading days against a fake broker, including weekends, half-days, missed windows and the kill switch, and check that it never day-trades and never spends more cash than it has.
+Keeping `decide.py` free of network calls made the most important logic easy to test. `tests/test_decide.py` covers the timing rules (entry window, half-days, holidays, missed morning sells). `tests/test_bot_flow.py` runs the real `tick` function through full simulated trading days against a fake broker, including weekends, the kill switch, orders that don't fill, and the down-day rule, and checks that it never day-trades and never spends more cash than it has.
 
 ## Running it yourself
 
@@ -143,7 +143,14 @@ cp .env.example .env              # add Alpaca paper keys
 .venv/bin/python run_bot.py status
 ```
 
-To deploy to a server set up like mine (an `overnight-bot` entry in `~/.ssh/config`), run `scripts/deploy.sh`. Then install the two files in `deploy/systemd/` into `/etc/systemd/system/` and run `sudo systemctl enable --now overnight-bot.timer`.
+To deploy to a server set up like mine (an `overnight-bot` entry in `~/.ssh/config`), the first time:
+
+1. On the server: `python3 -m venv ~/overnight-bot/.venv` (after `sudo apt install python3.12-venv`).
+2. Run `scripts/deploy.sh` to copy the code and run the tests there.
+3. Copy your `.env` to `~/overnight-bot/.env` on the server and `chmod 600` it. The deploy script never sends it.
+4. Install the two files in `deploy/systemd/` into `/etc/systemd/system/` and run `sudo systemctl enable --now overnight-bot.timer`.
+
+After that, every update is just `scripts/deploy.sh`.
 
 ## What's next
 

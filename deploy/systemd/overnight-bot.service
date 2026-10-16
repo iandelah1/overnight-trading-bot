@@ -1,0 +1,11 @@
+[Unit]
+Description=Overnight trading bot: one tick
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/overnight-bot
+ExecStart=/home/ubuntu/overnight-bot/.venv/bin/python run_bot.py tick
+TimeoutStartSec=120

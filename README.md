@@ -1,133 +1,153 @@
 # Overnight Trading Bot
 
-**Current setup: TQQQ (3x Nasdaq-100), $500.** The backtests below use SPY/SPYM. See `run_backtest.py --ticker TQQQ` for TQQQ.
+A bot that buys a stock ETF right before the market closes and sells it right after the market opens the next morning, so it only ever holds overnight. It trades through Alpaca's API and runs on its own on an AWS EC2 server, so my laptop doesn't need to be on.
 
-Buys an S&P 500 ETF in the **closing auction** and sells it in the **next opening auction**, so it only holds the market overnight. Runs on Alpaca.
+It's currently paper trading TQQQ (a 3x leveraged Nasdaq-100 ETF) with a $500 account.
 
-*Educational project, not financial advice.*
+> This is a personal learning project, not financial advice. Leveraged ETFs can lose a lot of money very quickly.
 
-## What the backtest says (SPY, 1993–2026)
+## Why overnight?
 
-| | Return/yr | Volatility | Worst drawdown | After 22% tax |
-|---|---|---|---|---|
-| Buy & hold | 10.9% | 18.5% | −55% | 10.1% |
-| Overnight, every night, no costs | 10.1% | 10.6% | −33% | 7.9% |
-| Overnight + 200-day trend filter (default) | 9.1% | 6.4% | −13% | 7.2% |
-| Intraday only (open→close) | 0.7% | 15.2% | −69% | — |
+I kept reading about the "overnight anomaly": if you split the stock market's return into what happens while the market is open (open → close) and what happens while it's closed (close → next open), nearly all of the long-run gain has come overnight. I wanted to check that myself before building anything, so the first thing I wrote was a backtest.
 
-Since 2018, on SPYM itself with the trend filter: 9.6%/yr, −14% worst drawdown, vs. 14.7%/yr and −34% for buy & hold.
+Using SPY data from 1993 to 2026:
 
-**What that means:**
-- Almost all of the market's gain has historically come overnight.
-- The strategy does **not** beat buy-and-hold on returns, especially after taxes. What it offers is a much smoother ride.
-- **Costs decide everything.** Every 1 bp (0.01%) of slippage per side costs about 5%/yr. That's why the bot only trades in the opening and closing auctions.
+| | Return per year | Volatility | Worst drawdown |
+|---|---|---|---|
+| Buy and hold | 10.9% | 18.5% | -55% |
+| Overnight only (close → open) | 10.1% | 10.6% | -33% |
+| Intraday only (open → close) | 0.7% | 15.2% | -69% |
+| Overnight + 200-day trend filter | 9.1% | 6.4% | -13% |
 
-Reproduce:
+So the effect is real, but it isn't free money. Overnight-only roughly matches buy-and-hold with about half the time in the market, and it doesn't beat it, especially after taxes since every trade is short-term. The bigger lesson was about costs: trading twice a day means every 0.01% of slippage costs about 5% a year. That's why execution details ended up mattering more than anything else.
 
-```bash
-.venv/bin/python run_backtest.py --trend 200 --bps 0 --yearly
-.venv/bin/python run_backtest.py --ticker SPYM --start 2018 --trend 200 --bps 0.25 --capital 500
-```
+The **200-day trend filter** (only hold overnight when the price is above its 200-day average) was the most useful rule I tested. It gave up a little return and cut the worst drawdown from -33% to -13%.
+
+### Why TQQQ
+
+I also tested 2x and 3x leveraged ETFs. From 2018 to 2026, with the trend filter and trading costs included:
+
+| | Return per year | Worst drawdown |
+|---|---|---|
+| TQQQ, this strategy | 28.7% | -47% |
+| TQQQ, buy and hold | 35.3% | -82% |
+
+Buy-and-hold TQQQ made more, but it also fell 82% at one point. The overnight version captured most of the gain with a much smaller worst case. I'm skeptical of these numbers though: 2018–2026 was a great period for the Nasdaq, and when I simulated a 3x Nasdaq fund through the 2000–2002 crash, $500 dropped to about $264 even with the trend filter. So I'm paper trading it first.
+
+### Adding the "overnight drift" paper
+
+After the first version was running, I read the NY Fed's [The Overnight Drift](https://www.newyorkfed.org/medialibrary/media/research/staff_reports/sr917.pdf) (Boyarchenko, Larsen & Whelan, Staff Report 917). Their argument is that the overnight gain comes from market makers who get stuck buying when people sell into the close. They want to be paid for holding that risk overnight, so prices tend to bounce back, and the bounce is much bigger after sell-offs than after rallies.
+
+I checked whether that shows up in plain daily SPY data (`research/overnight_drift.py`). It does:
+
+| What happened that day | Average next overnight return |
+|---|---|
+| Up day | 2.3 bps |
+| Down day | 6.1 bps |
+| Down day with VIX ≥ 20 | 8.7 bps |
+
+It held in both 1993–2009 and 2010–2026. That created a conflict with my trend filter, which sits out exactly when prices are falling. So I tested variants. Only trading after down days was worse, because up-day nights still earn more than the trading cost. The version that worked was **"hold if the trend is up OR the price fell today"**:
+
+| | Current rule (trend only) | Trend OR down day |
+|---|---|---|
+| SPY 1994–2026 | 8.3%/yr, worst -13% | 10.1%/yr, worst -20% |
+| TQQQ 2011–2026 | 29.1%/yr, worst -47% | 36.5%/yr, worst -52% |
+
+It was better in every period I tested, at the cost of a deeper worst case, since it now holds some nights during bear markets. I tested 9 variants, which is a lot of chances for something to look good by luck. This one came from the paper's hypothesis rather than from mining the data, so I'm running it in paper trading to see if it holds up.
 
 ## How it trades
 
-`EXECUTION=regular` (current setting, works in paper): buy with a normal limit order between 3:40 and 3:58 pm ET, then queue a market sell right after the close, which fills at the next open. `EXECUTION=auction` uses the auction orders below; Alpaca's paper simulator never fills those, so use it live only.
+Every 5 minutes the bot wakes up, looks at the time and the account, and does at most one thing:
 
-Auction mode:
+1. **3:40–3:58 pm ET:** if it isn't holding anything, and either the price is above its 200-day average or the price fell today, buy as many whole shares as the cash allows (limit order, capped 2% above the last price).
+2. **Right after the 4:00 pm close:** queue a market sell, which executes at the next morning's open.
+3. **9:30 am ET:** the sell fills, and the cycle repeats that afternoon.
 
-| Time (ET) | Action |
-|---|---|
-| 3:30–3:49 pm | If the price is above its 200-day average, place a **limit-on-close** buy for whole shares (limit 1% above the current price). |
-| 4:00 pm | The closing auction fills the buy. |
-| after 7:00 pm (or before 9:28 am) | Queue a **market-on-open** sell. |
-| 9:30 am | The opening auction fills the sell. If that's missed, the bot sells at market. |
+Half-days and holidays come from Alpaca's market calendar.
 
-- The bot runs `tick` every 5 minutes. Each tick looks at the clock and the account, and does at most one thing.
-- Half-days are handled automatically from Alpaca's market calendar.
+I originally used closing-auction and opening-auction orders, which give the cleanest prices. It turned out Alpaca's paper-trading simulator never fills auction orders. My first three buys all expired even though the price was below my limit. So I added a "regular" mode that uses normal orders, which costs about a penny a day at this size. Auction mode is still in the code for live trading.
 
-### Why SPYM
+### Safety rules
 
-With $500 you can't buy a whole share of SPY (~$780), and Alpaca's auction orders require **whole shares**. SPYM tracks the S&P 500, trades ~$1.3B a day, and costs ~$92 a share, so 5 shares fit. Its overnight returns correlate 0.996 with SPY's.
+These are the parts I spent the most time on, because a bug here costs real money:
 
-## Rules and safety built in
+- **No day trades.** It never sells shares on the same day it bought them.
+- **No borrowing.** Orders are sized against actual cash (not margin buying power) at the limit price, so a fill can never exceed the account balance.
+- **No settlement violations.** Alpaca accounts under $2,000 are "limited margin" and can trade on unsettled funds, so the daily round trip doesn't trigger good-faith violations.
+- **Drawdown stop.** New buys stop if equity falls a set percentage below its peak. Sells always still happen.
+- **Kill switch.** A `STOP` file blocks new buys. `run_bot.py flatten` sells everything immediately.
+- **Account checks.** If Alpaca flags the account as blocked, or ever counts a day trade, the bot stops buying and alerts me.
+- **Paper by default.** Live trading needs both `ALPACA_PAPER=false` and a `--live` flag, so it can't happen by accident.
 
-- **No day trades, ever.** Shares are always held overnight, and the bot refuses to sell anything bought the same day. It warns you if Alpaca's day-trade count is ever above 0.
-- **No good-faith violations.** Alpaca has no cash accounts. Accounts under $2,000 are "limited margin" accounts that may trade on unsettled funds.
-- **Never borrows.** Orders are sized against `min(cash, buying power)` at the limit price and capped at `MAX_POSITION_USD`, so a margin balance or margin call can't happen.
-- **Account flags.** If Alpaca marks the account blocked, suspended or not active, new buys stop and you get a notification.
-- **Kill switch.** Create a file named `STOP` in this folder to block new buys. Any shares already held still get sold.
-- **Drawdown halt.** New buys stop if equity drops 20% below its peak.
-- **Live trading is locked behind two switches:** `ALPACA_PAPER=false` in `.env` **and** `--live` on the command.
-- **Notifications.** macOS notifications on every buy, sell, skip, and error. Full log in `logs/bot.log`.
+## Running it on AWS
 
-## Setup
+The bot first ran on my Mac with launchd. That failed in the most predictable way possible: my laptop was asleep during the buy window and it missed a trade. So I moved it to EC2.
 
-1. Create an Alpaca account and open the **Paper Trading** dashboard. Reset the paper account balance to **$500** so it behaves like the real account.
-2. Generate paper API keys and paste them into `.env`. The template is `.env.example`.
-3. Check the connection:
-   ```bash
-   .venv/bin/python run_bot.py status
-   ```
-4. Start the 5-minute schedule:
-   ```bash
-   scripts/install_schedule.sh
-   ```
-5. Keep the Mac **awake and online** from 3:30 pm to 9:35 am ET on weekdays. If it's asleep during the entry window, the bot just skips that night, which is safe. A $5/month cloud server is the robust long-term option.
-6. After a few weeks, review results:
-   ```bash
-   .venv/bin/python run_bot.py report
-   ```
-   Compare the fills against the backtest.
-
-### Comparing several funds side by side (profiles)
-
-`profiles/sso.env`, `profiles/upro.env` and `profiles/tqqq.env` each run the same strategy on a different fund. A profile only lists what differs from `.env`.
-
-There are two ways to give the profiles money:
-- **Separate paper accounts (cleanest):** paste each paper account's keys into its profile and set each account to $500.
-- **One shared paper account:** leave the profile keys blank, set the `.env` paper account to $1,500, and each profile is capped at $500.
-
-Commands:
-
-```bash
-.venv/bin/python run_bot.py status --profile all
-PROFILE=all scripts/install_schedule.sh       # schedule all three
-.venv/bin/python run_bot.py compare           # side-by-side paper results
+```mermaid
+flowchart LR
+    T[systemd timer<br/>every 5 min] --> B
+    subgraph EC2 [EC2 t4g.micro · Ubuntu 24.04 · Arm]
+        B[run_bot.py tick] --> L[logs + trade journal]
+    end
+    B -- HTTPS --> A[Alpaca API]
+    B -- sns:Publish via IAM role --> S[SNS topic] --> E[Email alerts]
+    Me[My laptop] -- SSH tunneled through<br/>SSM Session Manager --> EC2
 ```
 
-### Going live (after 1–2 months of paper that matches the backtest)
+- **Compute:** EC2 t4g.micro (AWS Graviton, Arm) running Ubuntu 24.04, with 1 GB of swap so installing pandas doesn't run out of memory.
+- **Scheduling:** a systemd service + timer (`deploy/systemd/`). It survives reboots, and the logs go to `journalctl` as well as `logs/bot.log`.
+- **Alerts:** every buy, sell, skip and error is published to an SNS topic that emails me. Fills include the P&L, like `SOLD 6 TQQQ @ $75.02: +$5.52 (+1.24%)`.
+- **No stored AWS keys:** the server gets temporary credentials from an IAM role. The role's only permission is `sns:Publish` on that one topic, plus the AWS-managed policy Session Manager needs.
+- **No open inbound ports:** the security group has zero inbound rules. I connect with Session Manager, and `ssh`/`rsync` are tunneled through it via a `ProxyCommand`, so access is controlled by IAM instead of an IP allowlist.
+- **Secrets:** the Alpaca keys live only in `.env` on the server (`chmod 600`) and are never committed.
+- **Cost:** about $10/month (instance, disk and public IPv4), currently covered by AWS credits.
 
-1. Fund the live account and create **live** API keys. These are different from paper keys.
-2. In `.env`, set the live keys and `ALPACA_PAPER=false`.
-3. Reinstall the schedule in live mode:
-   ```bash
-   scripts/install_schedule.sh --live
-   ```
+## Trade journal
 
-### Commands
+Every fill is appended to `journal/trades.csv`: time, side, shares, price, and P&L when a sell closes a buy. The bot tracks which order IDs it has already recorded, so a fill is never written twice.
 
 ```bash
-.venv/bin/python run_bot.py status     # account, position, orders, state
-.venv/bin/python run_bot.py report     # nightly P&L
-.venv/bin/python run_bot.py flatten    # emergency: cancel everything and sell
-scripts/uninstall_schedule.sh          # stop the bot
-.venv/bin/pytest                       # run tests
+python run_bot.py trades     # journal plus totals
+python run_bot.py report     # P&L rebuilt from Alpaca's order history
+python run_bot.py status     # account, position, open orders
 ```
 
-## Taxes
+## Project layout
 
-In a regular taxable account:
-- Every round trip is a **short-term** trade.
-- Selling at a loss and rebuying the same ETF that afternoon creates **wash sales**. The loss isn't gone; it's added to the cost basis of the new shares.
-- Alpaca's 1099 handles the reporting, but expect a long form at tax time.
+```
+overnight/
+  strategy.py   entry filters, shared by the backtest and the live bot
+  backtest.py   close-to-open backtest with costs, taxes, whole-share sim
+  decide.py     pure decision logic for one tick (no network calls)
+  broker.py     thin wrapper around the Alpaca API
+  bot.py        runs a tick: snapshot → decide → act → notify
+  journal.py    trade journal + P&L
+  config.py     settings from .env (and optional per-profile overrides)
+research/
+  overnight_drift.py   tests the NY Fed overnight-drift findings on SPY and TQQQ
+run_backtest.py, run_bot.py   command-line entry points
+deploy/systemd/               the service and timer used on EC2
+scripts/deploy.sh             rsync to the server and run the tests there
+tests/                        42 tests
+```
 
-An IRA avoids all of this.
+Keeping `decide.py` free of network calls made the most important logic easy to test. The tests in `tests/test_bot_flow.py` run the real `tick` function through full simulated trading days against a fake broker, including weekends, half-days, missed windows and the kill switch, and check that it never day-trades and never spends more cash than it has.
 
-## Files
+## Running it yourself
 
-- `overnight/strategy.py`: entry filters, shared by the backtest and the live bot.
-- `overnight/backtest.py`, `run_backtest.py`: the backtest.
-- `overnight/decide.py`: pure decision logic. Fully unit-tested.
-- `overnight/broker.py`: Alpaca API wrapper.
-- `overnight/bot.py`, `run_bot.py`: tick runner, flatten, status, report.
-- `tests/`: unit tests plus full simulated trading days against a fake broker.
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env              # add Alpaca paper keys
+.venv/bin/pytest -q
+.venv/bin/python run_backtest.py --ticker SPY --trend 200 --yearly
+.venv/bin/python run_bot.py status
+```
+
+To deploy to a server set up like mine (an `overnight-bot` entry in `~/.ssh/config`), run `scripts/deploy.sh`. Then install the two files in `deploy/systemd/` into `/etc/systemd/system/` and run `sudo systemctl enable --now overnight-bot.timer`.
+
+## What's next
+
+- Run it on paper for a few weeks and compare real fills against the backtest
+- GitHub Actions to run the tests and deploy automatically on every push
+- A CloudWatch alarm that auto-recovers the instance if the hardware fails
+- Possibly move it to Lambda + EventBridge + DynamoDB, which would cost about $0/month

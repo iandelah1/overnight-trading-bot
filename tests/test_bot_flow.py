@@ -271,3 +271,22 @@ def test_notify_emails_via_sns_and_survives_failures(monkeypatch):
 
     fake_boto3.client = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no network"))
     bot.notify("still fine", "default")  # must not raise
+
+
+def test_down_day_rule_buys_below_trend_only_after_a_drop(regular, monkeypatch):
+    sent = []
+    monkeypatch.setattr(bot, "notify", lambda msg, profile="": sent.append(msg))
+    f = Filters(trend_sma_days=200, down_day="daily", down_day_overrides_trend=True)
+    s = replace(regular, filters=f)
+
+    up = FakeBroker(closes_above_sma=False)   # downtrend; last close 91.05
+    up.price = 91.10                           # but up today -> still skip
+    run_day(up, s, date(2026, 10, 12), open_px=91.10, close_px=91.10)
+    assert up.fills == []
+
+    down = FakeBroker(closes_above_sma=False)
+    down.clock = datetime(2026, 10, 13, 9, 0, tzinfo=ET)  # new day: the bot already decided Monday
+    down.price = 90.50                         # down today -> bounce night, buy
+    run_day(down, s, date(2026, 10, 13), open_px=90.50, close_px=90.50)
+    assert down.fills and down.fills[0][0] == "buy", sent
+    assert any("down-day bounce" in m for m in sent)

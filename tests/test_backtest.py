@@ -44,3 +44,32 @@ def test_whole_share_sim():
     # 5 shares at 92, sold at 100 -> +40; $40 idle cash never invested.
     assert sim["Shares"].iloc[0] == 5
     assert sim["Equity"].iloc[0] == pytest.approx(540)
+
+
+def test_down_day_rules():
+    # Mon: up day, Tue: intraday drop, Wed: gap down but closes above its open, Thu: big drop
+    df = frame(opens=[100, 102, 99, 100], closes=[101, 100, 99.5, 97])
+    intraday = hold_mask(df, Filters(down_day="intraday")).tolist()
+    daily = hold_mask(df, Filters(down_day="daily")).tolist()
+    big = hold_mask(df, Filters(down_day="intraday", down_day_min_pct=0.025)).tolist()
+    assert intraday == [False, True, False, True]
+    assert daily == [False, True, True, True]
+    assert big == [False, False, False, True]
+
+
+def test_down_day_and_vs_override_trend():
+    closes = [100 + i for i in range(10)] + [105, 104]  # uptrend, then two down days
+    df = frame(opens=[c + 0.5 for c in closes], closes=closes)  # every day closes below its open
+    trend = Filters(trend_sma_days=5)
+    both = Filters(trend_sma_days=5, down_day="daily")
+    either = Filters(trend_sma_days=5, down_day="daily", down_day_overrides_trend=True)
+    t, b, e = (hold_mask(df, f) for f in (trend, both, either))
+    assert (b == (t & (df["Close"].pct_change() < 0))).all()
+    assert (e == (t | (df["Close"].pct_change() < 0))).all()
+    assert e.sum() >= t.sum() >= b.sum()
+
+
+def test_live_intraday_rule_needs_open():
+    df = frame([100, 101], [101, 100])
+    with pytest.raises(ValueError):
+        should_hold_tonight(df[["Close"]], df.index[-1], Filters(down_day="intraday"))

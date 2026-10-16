@@ -78,6 +78,16 @@ def _execution(value: str) -> str:
     return value
 
 
+def _down_day(value: str) -> str:
+    value = value.strip().lower()
+    if value == "intraday":
+        # Live history only has closes; the intraday rule would need today's open.
+        raise SystemExit("DOWN_DAY=intraday is backtest-only; use 'daily' or leave it blank")
+    if value not in ("", "daily"):
+        raise SystemExit(f"DOWN_DAY must be 'daily' or blank, not {value!r}")
+    return value
+
+
 @lru_cache
 def alert_topic_arn(profile: str = DEFAULT_PROFILE) -> str:
     """SNS topic for email alerts (ALERT_TOPIC_ARN); empty means no emails."""
@@ -97,7 +107,10 @@ def load_settings(profile: str = DEFAULT_PROFILE) -> Settings:
         paper=flag("ALPACA_PAPER", True),
         symbol=v.get("SYMBOL", "SPYM").upper(),
         filters=Filters(trend_sma_days=int(sma) if sma else None,
-                        skip_weekends=flag("SKIP_WEEKENDS", False)),
+                        skip_weekends=flag("SKIP_WEEKENDS", False),
+                        down_day=_down_day(v.get("DOWN_DAY", "")),
+                        down_day_min_pct=float(v.get("DOWN_DAY_MIN_PCT", "0") or 0),
+                        down_day_overrides_trend=flag("DOWN_DAY_OVERRIDES_TREND", False)),
         max_position_usd=float(v.get("MAX_POSITION_USD", "500")),
         entry_limit_pct=float(v.get("ENTRY_LIMIT_PCT", "0.01")),
         max_drawdown_pct=float(v.get("MAX_DRAWDOWN_PCT", "0.20")),

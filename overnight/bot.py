@@ -4,6 +4,7 @@ import json
 import logging
 import subprocess
 import time
+from dataclasses import replace
 from datetime import date
 
 import pandas as pd
@@ -118,6 +119,7 @@ def enter(settings: Settings, broker: Broker, state: dict, today: date, spendabl
     price = broker.last_price()
     history = broker.daily_closes(before=today, days=(settings.filters.trend_sma_days or 0) + 5)
     history.loc[pd.Timestamp(today)] = price  # today's close ~ the latest trade
+    trend_alone_ok = should_hold_tonight(history, pd.Timestamp(today), replace(settings.filters, down_day=""))
     if not should_hold_tonight(history, pd.Timestamp(today), settings.filters):
         notify(f"Skipping tonight: filters say no ({settings.filters}), last ${price:.2f}", settings.profile)
         return
@@ -129,7 +131,8 @@ def enter(settings: Settings, broker: Broker, state: dict, today: date, spendabl
     tif = "cls" if settings.execution == "auction" else "day"
     broker.buy(qty, limit, tif)
     kind = "limit-on-close" if tif == "cls" else "limit"
-    notify(f"BUY {qty} {settings.symbol} {kind} ${limit:.2f} (last ${price:.2f})", settings.profile)
+    why = "" if trend_alone_ok else " [down-day bounce: below the trend average but down today]"
+    notify(f"BUY {qty} {settings.symbol} {kind} ${limit:.2f} (last ${price:.2f}){why}", settings.profile)
 
 
 def flatten(settings: Settings, broker: Broker) -> None:

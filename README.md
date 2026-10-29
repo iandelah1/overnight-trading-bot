@@ -3,12 +3,9 @@
 A bot that buys a stock ETF right before the market closes and sells it right after the market opens the next morning, so it only ever holds overnight. It trades through Alpaca's API and runs on its own on an AWS EC2 server, so my laptop doesn't need to be on.
 
 It's currently paper trading TQQQ (a 3x leveraged Nasdaq-100 ETF) with a $500 account.
-
-> This is a personal learning project, not financial advice. Leveraged ETFs can lose a lot of money very quickly.
-
 ## Why overnight?
 
-I kept reading about the "overnight anomaly": if you split the stock market's return into what happens while the market is open (open → close) and what happens while it's closed (close → next open), nearly all of the long-run gain has come overnight. I wanted to check that myself before building anything, so the first thing I wrote was a backtest.
+I kept reading about the "overnight anomaly": if you split the stock market's return into what happens while the market is open (open → close) and what happens while it's closed (close → next open), nearly all of the long-run gain has come overnight. 
 
 Using SPY data from 1993 to 2026:
 
@@ -19,7 +16,7 @@ Using SPY data from 1993 to 2026:
 | Intraday only (open → close) | 0.7% | 15.2% | -69% |
 | Overnight + 200-day trend filter | 9.1% | 6.4% | -13% |
 
-So the effect is real, but it isn't free money. Overnight-only roughly matches buy-and-hold with about half the time in the market, and it doesn't beat it, especially after taxes since every trade is short-term. The bigger lesson was about costs: trading twice a day means every 0.01% of slippage costs about 5% a year. That's why execution details ended up mattering more than anything else.
+So the effect is real, but it isn't free money. Overnight-only roughly matches buy-and-hold with about half the time in the market, and it doesn't beat it, especially after taxes since every trade is short-term. Trading twice a day means every 0.01% of slippage costs about 5% a year. 
 
 The **200-day trend filter** (only hold overnight when the price is above its 200-day average) was the most useful rule I tested. It gave up a little return and cut the worst drawdown from -33% to -13%.
 
@@ -32,11 +29,11 @@ I also tested 2x and 3x leveraged ETFs. From 2018 to 2026, with the trend filter
 | TQQQ, overnight with the trend rule | 28.7% | -47% |
 | TQQQ, buy and hold | 35.3% | -82% |
 
-Buy-and-hold TQQQ made more, but it also fell 82% at one point. The overnight version captured most of the gain with a much smaller worst case. I'm skeptical of these numbers though: 2018–2026 was a great period for the Nasdaq, and when I simulated a 3x Nasdaq fund through the 2000–2002 crash, $500 dropped to about $264 even with the trend filter. So I'm paper trading it first.
+Buy-and-hold TQQQ made more, but it also fell 82% at one point. The overnight version captured most of the gain with a much smaller worst case..
 
 ### Adding the "overnight drift" paper
 
-After the first version was running, I read the NY Fed's [The Overnight Drift](https://www.newyorkfed.org/medialibrary/media/research/staff_reports/sr917.pdf) (Boyarchenko, Larsen & Whelan, Staff Report 917). Their argument is that the overnight gain comes from market makers who get stuck buying when people sell into the close. They want to be paid for holding that risk overnight, so prices tend to bounce back, and the bounce is much bigger after sell-offs than after rallies.
+NY Fed's [The Overnight Drift](https://www.newyorkfed.org/medialibrary/media/research/staff_reports/sr917.pdf) (Boyarchenko, Larsen & Whelan, Staff Report 917). Their argument is that the overnight gain comes from market makers who get stuck buying when people sell into the close. They want to be paid for holding that risk overnight, so prices tend to bounce back, and the bounce is much bigger after sell-offs than after rallies.
 
 I checked whether that shows up in plain daily SPY data (`research/overnight_drift.py`). It does:
 
@@ -46,7 +43,7 @@ I checked whether that shows up in plain daily SPY data (`research/overnight_dri
 | Down day | 6.1 bps |
 | Down day with VIX ≥ 20 | 8.7 bps |
 
-It held in both 1993–2009 and 2010–2026. That created a conflict with my trend filter, which sits out exactly when prices are falling. So I tested variants. Only trading after down days was worse, because up-day nights still earn more than the trading cost. The version that worked was **"hold if the trend is up OR the price fell today"**:
+It held in both 1993–2009 and 2010–2026. That created a conflict with my trend filter, which sits out exactly when prices are falling. I tested variants. Only trading after down days was worse, because up-day nights still earn more than the trading cost. The version that worked was **"hold if the trend is up OR the price fell today"**:
 
 | | Trend only (original rule) | Trend OR down day (what the bot runs now) |
 |---|---|---|
@@ -69,8 +66,6 @@ I originally used closing-auction and opening-auction orders, which give the cle
 
 ### Safety rules
 
-These are the parts I spent the most time on, because a bug here costs real money:
-
 - **No day trades.** It never sells shares on the same day it bought them.
 - **No borrowing.** Orders are sized against actual cash (not margin buying power) at the limit price, so a fill can never exceed the account balance.
 - **No settlement violations.** Alpaca accounts under $2,000 are "limited margin" and can trade on unsettled funds, so the daily round trip doesn't trigger good-faith violations.
@@ -81,7 +76,7 @@ These are the parts I spent the most time on, because a bug here costs real mone
 
 ## Running it on AWS
 
-The bot first ran on my Mac with launchd. That failed in the most predictable way possible: my laptop was asleep during the buy window and it missed a trade. So I moved it to EC2.
+I moved it to EC2 from my mac.
 
 ```mermaid
 flowchart LR
